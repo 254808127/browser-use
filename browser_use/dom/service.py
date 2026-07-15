@@ -77,6 +77,27 @@ class DomService:
 	async def __aexit__(self, exc_type, exc_value, traceback):
 		pass  # no need to cleanup anything, browser_session auto handles cleaning up session cache
 
+	def _get_oopif_target_map(self) -> dict[str, dict[str, Any]]:
+		"""Build the OOPIF frame-to-target mapping from active target state."""
+		session_manager = self.browser_session.session_manager
+		if session_manager is None:
+			return {}
+
+		# Chromium identifies an iframe DevTools target and its Page.FrameId with
+		# the same DevToolsFrameToken. SessionManager already tracks these targets,
+		# so querying every target's frame tree adds no information for this lookup.
+		return {
+			str(target_id): {
+				'id': str(target_id),
+				'url': target.url,
+				'title': target.title,
+				'frameTargetId': str(target_id),
+				'isCrossOrigin': True,
+			}
+			for target_id, target in session_manager.get_all_targets().items()
+			if target.target_type in ('iframe', 'webview')
+		}
+
 	def _count_hidden_elements_in_iframes(self, node: EnhancedDOMTreeNode) -> None:
 		"""Collect hidden interactive elements in iframes for LLM hints.
 
@@ -1008,9 +1029,9 @@ class DomService:
 						self.logger.debug('Skipping invisible cross-origin iframe')
 
 					if should_process_iframe:
-						# Lazy fetch all_frames only when actually needed (for cross-origin iframes)
+						# Snapshot active OOPIF targets only when a visible cross-origin iframe needs them.
 						if all_frames is None:
-							all_frames, _ = await self.browser_session.get_all_frames()
+							all_frames = self._get_oopif_target_map()
 
 						# Use pre-fetched all_frames to find the iframe's target (no redundant CDP call)
 						frame_id = node.get('frameId', None)
@@ -1035,11 +1056,8 @@ class DomService:
 							frame_info = all_frames.get(frame_id)
 							if frame_info and frame_info.get('frameTargetId'):
 								iframe_target_id = frame_info['frameTargetId']
-								# Use frameTargetId directly from all_frames — get_all_frames() already
-								# validated connectivity. Do NOT gate on session_manager.get_target():
-								# there is a race where _target_sessions is set (inside the lock in
-								# _handle_target_attached) before _targets is populated (outside the
-								# lock), so get_target() can transiently return None for a live target.
+								# SessionManager publishes target and session mappings atomically, so
+								# this lookup either returns the active target or observes its detach.
 								iframe_target = self.browser_session.session_manager.get_target(iframe_target_id)
 								iframe_document_target = {
 									'targetId': iframe_target_id,
