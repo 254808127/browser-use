@@ -3736,12 +3736,17 @@ class BrowserSession(BaseModel):
 
 		return url_allowed and type_allowed
 
-	async def get_all_frames(self) -> tuple[dict[str, dict], dict[str, str]]:
+	async def get_all_frames(self, *, include_metadata: bool = True) -> tuple[dict[str, dict], dict[str, str]]:
 		"""Get a complete frame hierarchy from all browser targets.
+
+		Args:
+			include_metadata: Populate frame-owner backend node IDs and parent target IDs.
+				Callers that only need frame-to-target mappings can disable this expensive pass.
 
 		Returns:
 			Tuple of (all_frames, target_sessions) where:
-			- all_frames: dict mapping frame_id -> frame info dict with all metadata
+			- all_frames: dict mapping frame_id -> frame info dict, with owner metadata
+			  when include_metadata is enabled
 			- target_sessions: dict mapping target_id -> session_id for active sessions
 		"""
 		all_frames = {}  # frame_id -> FrameInfo dict
@@ -3872,7 +3877,7 @@ class BrowserSession(BaseModel):
 
 		# Second pass: populate backend node IDs and parent target IDs
 		# Only do this if cross-origin support is enabled
-		if include_cross_origin:
+		if include_cross_origin and include_metadata:
 			await self._populate_frame_metadata(all_frames, target_sessions)
 
 		return all_frames, target_sessions
@@ -3936,14 +3941,14 @@ class BrowserSession(BaseModel):
 	async def cdp_client_for_frame(self, frame_id: str) -> CDPSession:
 		"""Get a CDP client attached to the target containing the specified frame.
 
-		Builds a unified frame hierarchy from all targets to find the correct target
-		for any frame, including OOPIFs (Out-of-Process iframes).
+		Resolves active OOPIFs directly from SessionManager and falls back to a
+		unified frame hierarchy for other frame types.
 
 		Args:
 			frame_id: The frame ID to search for
 
 		Returns:
-			Tuple of (cdp_cdp_session, target_id) for the target containing the frame
+			CDP session for the target containing the frame
 
 		Raises:
 			ValueError: If the frame is not found in any target
@@ -3952,8 +3957,16 @@ class BrowserSession(BaseModel):
 		if not self.browser_profile.cross_origin_iframes:
 			return await self.get_or_create_cdp_session()
 
+		# Chromium uses the same DevToolsFrameToken for an OOPIF's Page.FrameId
+		# and TargetId, so active OOPIF targets can be resolved without scanning
+		# every browser target over CDP.
+		if self.session_manager:
+			target = self.session_manager.get_target(frame_id)
+			if target and target.target_type in ('iframe', 'webview'):
+				return await self.get_or_create_cdp_session(frame_id, focus=False)
+
 		# Get complete frame hierarchy
-		all_frames, target_sessions = await self.get_all_frames()
+		all_frames, target_sessions = await self.get_all_frames(include_metadata=False)
 
 		# Find the requested frame
 		frame_info = await self.find_frame_target(frame_id, all_frames)
@@ -3963,8 +3976,6 @@ class BrowserSession(BaseModel):
 
 			if target_id in target_sessions:
 				assert target_id is not None
-				# Use existing session
-				session_id = target_sessions[target_id]
 				# Return the client with session attached (don't change focus)
 				return await self.get_or_create_cdp_session(target_id, focus=False)
 
