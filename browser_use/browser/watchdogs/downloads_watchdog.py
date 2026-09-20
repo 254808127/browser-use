@@ -741,89 +741,139 @@ class DownloadsWatchdog(BaseWatchdog):
 		stream: str | None = None
 		partial_path: Path | None = None
 		try:
-			state = await asyncio.wait_for(
-				cdp.Runtime.evaluate(
-					params={
-						'expression': '({controller: new AbortController(), blob: null})',
-						'objectGroup': group,
-						'returnByValue': False,
-					},
-					session_id=session.session_id,
-				),
-				timeout=_DOWNLOAD_IO_TIMEOUT,
-			)
-			state_id = state.get('result', {}).get('objectId')
-			if not state_id or state.get('exceptionDetails'):
-				raise RuntimeError('Could not create browser download state')
+			try:
+				state = await asyncio.wait_for(
+					cdp.Runtime.evaluate(
+						params={
+							'expression': '({controller: new AbortController(), blob: null})',
+							'objectGroup': group,
+							'returnByValue': False,
+						},
+						session_id=session.session_id,
+					),
+					timeout=_DOWNLOAD_IO_TIMEOUT,
+				)
+				state_id = state.get('result', {}).get('objectId')
+				if not state_id or state.get('exceptionDetails'):
+					raise RuntimeError('Could not create browser download state')
 
-			response = await asyncio.wait_for(
-				cdp.Runtime.callFunctionOn(
-					params={
-						'objectId': state_id,
-						'functionDeclaration': """async function(url) {
-							const response = await fetch(url, {cache: 'force-cache', signal: this.controller.signal});
-							if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
-							this.blob = await response.blob();
-							return {size: this.blob.size, from_cache: response.headers.has('age') || !response.headers.has('date')};
-						}""",
-						'arguments': [{'value': url}],
-						'awaitPromise': True,
-						'returnByValue': True,
-					},
-					session_id=session.session_id,
-				),
-				timeout=_DOWNLOAD_FETCH_TIMEOUT,
-			)
-			if response.get('exceptionDetails'):
-				raise RuntimeError(f'Browser download failed: {response["exceptionDetails"].get("text", "JavaScript exception")}')
-			metadata = _DownloadMetadata.model_validate(response.get('result', {}).get('value'))
-			blob = await asyncio.wait_for(
-				cdp.Runtime.callFunctionOn(
-					params={
-						'objectId': state_id,
-						'functionDeclaration': 'function() { return this.blob; }',
-						'objectGroup': group,
-						'returnByValue': False,
-					},
-					session_id=session.session_id,
-				),
-				timeout=_DOWNLOAD_IO_TIMEOUT,
-			)
-			blob_id = blob.get('result', {}).get('objectId')
-			if not blob_id or blob.get('exceptionDetails'):
-				raise RuntimeError('Could not access browser download Blob')
-			resolved = await asyncio.wait_for(
-				cdp.IO.resolveBlob(params={'objectId': blob_id}, session_id=session.session_id), timeout=_DOWNLOAD_IO_TIMEOUT
-			)
-			# IO.StreamHandle explicitly supports blob:<uuid>; Chromium opens the Blob on the first IO.read.
-			# https://chromedevtools.github.io/devtools-protocol/tot/IO/#type-StreamHandle
-			stream = f'blob:{resolved["uuid"]}'
-			with tempfile.NamedTemporaryFile(
-				prefix='.browser-use-download-', suffix='.part', dir=download_path.parent, delete=False
-			) as partial:
-				partial_path = Path(partial.name)
-			written = 0
-			async with await anyio.open_file(partial_path, 'wb') as file:
-				while True:
-					chunk = await asyncio.wait_for(
-						cdp.IO.read(params={'handle': stream, 'size': _DOWNLOAD_CHUNK_SIZE}, session_id=session.session_id),
-						timeout=_DOWNLOAD_IO_TIMEOUT,
+				response = await asyncio.wait_for(
+					cdp.Runtime.callFunctionOn(
+						params={
+							'objectId': state_id,
+							'functionDeclaration': """async function(url) {
+								const response = await fetch(url, {cache: 'force-cache', signal: this.controller.signal});
+								if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+								this.blob = await response.blob();
+								return {size: this.blob.size, from_cache: response.headers.has('age') || !response.headers.has('date')};
+							}""",
+							'arguments': [{'value': url}],
+							'awaitPromise': True,
+							'returnByValue': True,
+						},
+						session_id=session.session_id,
+					),
+					timeout=_DOWNLOAD_FETCH_TIMEOUT,
+				)
+				if response.get('exceptionDetails'):
+					raise RuntimeError(
+						f'Browser download failed: {response["exceptionDetails"].get("text", "JavaScript exception")}'
 					)
-					data = (
-						base64.b64decode(chunk['data'], validate=True)
-						if chunk.get('base64Encoded')
-						else chunk['data'].encode('utf-8')
-					)
-					if len(data) > _DOWNLOAD_CHUNK_SIZE or written + len(data) > metadata.size:
-						raise ValueError('Download stream exceeded its expected size')
-					await file.write(data)
-					written += len(data)
-					if chunk.get('eof'):
-						break
-					if not data:
-						raise ValueError('Download stream made no progress')
-			if written != metadata.size:
-				raise ValueError(f'Incomplete download: expected {metadata.size} bytes, received {written}')
+				metadata = _DownloadMetadata.model_validate(response.get('result', {}).get('value'))
+				blob = await asyncio.wait_for(
+					cdp.Runtime.callFunctionOn(
+						params={
+							'objectId': state_id,
+							'functionDeclaration': 'function() { return this.blob; }',
+							'objectGroup': group,
+							'returnByValue': False,
+						},
+						session_id=session.session_id,
+					),
+					timeout=_DOWNLOAD_IO_TIMEOUT,
+				)
+				blob_id = blob.get('result', {}).get('objectId')
+				if not blob_id or blob.get('exceptionDetails'):
+					raise RuntimeError('Could not access browser download Blob')
+				resolved = await asyncio.wait_for(
+					cdp.IO.resolveBlob(params={'objectId': blob_id}, session_id=session.session_id), timeout=_DOWNLOAD_IO_TIMEOUT
+				)
+				# IO.StreamHandle explicitly supports blob:<uuid>; Chromium opens the Blob on the first IO.read.
+				# https://chromedevtools.github.io/devtools-protocol/tot/IO/#type-StreamHandle
+				stream = f'blob:{resolved["uuid"]}'
+				with tempfile.NamedTemporaryFile(
+					prefix='.browser-use-download-', suffix='.part', dir=download_path.parent, delete=False
+				) as partial:
+					partial_path = Path(partial.name)
+				written = 0
+				async with await anyio.open_file(partial_path, 'wb') as file:
+					while True:
+						chunk = await asyncio.wait_for(
+							cdp.IO.read(params={'handle': stream, 'size': _DOWNLOAD_CHUNK_SIZE}, session_id=session.session_id),
+							timeout=_DOWNLOAD_IO_TIMEOUT,
+						)
+						data = (
+							base64.b64decode(chunk['data'], validate=True)
+							if chunk.get('base64Encoded')
+							else chunk['data'].encode('utf-8')
+						)
+						if len(data) > _DOWNLOAD_CHUNK_SIZE or written + len(data) > metadata.size:
+							raise ValueError('Download stream exceeded its expected size')
+						await file.write(data)
+						written += len(data)
+						if chunk.get('eof'):
+							break
+						if not data:
+							raise ValueError('Download stream made no progress')
+				if written != metadata.size:
+					raise ValueError(f'Incomplete download: expected {metadata.size} bytes, received {written}')
+			finally:
+
+				async def release_resources() -> None:
+					if stream is not None:
+						try:
+							await asyncio.wait_for(
+								cdp.IO.close(params={'handle': stream}, session_id=session.session_id),
+								timeout=_DOWNLOAD_CLEANUP_TIMEOUT,
+							)
+						except Exception as exc:
+							self.logger.debug(f'Could not close download stream: {exc}')
+					if state_id is not None:
+						try:
+							await asyncio.wait_for(
+								cdp.Runtime.callFunctionOn(
+									params={
+										'objectId': state_id,
+										'functionDeclaration': 'function() { this.controller.abort(); this.blob = null; }',
+										'returnByValue': True,
+									},
+									session_id=session.session_id,
+								),
+								timeout=_DOWNLOAD_CLEANUP_TIMEOUT,
+							)
+						except Exception as exc:
+							self.logger.debug(f'Could not abort or release browser download: {exc}')
+					try:
+						await asyncio.wait_for(
+							cdp.Runtime.releaseObjectGroup(params={'objectGroup': group}, session_id=session.session_id),
+							timeout=_DOWNLOAD_CLEANUP_TIMEOUT,
+						)
+					except Exception as exc:
+						self.logger.debug(f'Could not release download object group: {exc}')
+
+				# A separate task survives cancellation of the download, including repeated cancellation.
+				# Every CDP cleanup operation above retains its own bounded timeout.
+				cleanup_task = asyncio.create_task(release_resources())
+				cancelled: asyncio.CancelledError | None = None
+				while not cleanup_task.done():
+					try:
+						await asyncio.shield(cleanup_task)
+					except asyncio.CancelledError as exc:
+						cancelled = exc
+				cleanup_task.result()
+				if cancelled is not None:
+					raise cancelled
+			# No cancellation point between publication and returning the completed download.
 			os.replace(partial_path, download_path)
 			return metadata
 		finally:
@@ -832,35 +882,6 @@ class DownloadsWatchdog(BaseWatchdog):
 					partial_path.unlink(missing_ok=True)
 				except OSError as exc:
 					self.logger.warning(f'Could not remove partial download {partial_path}: {exc}')
-			if stream is not None:
-				try:
-					await asyncio.wait_for(
-						cdp.IO.close(params={'handle': stream}, session_id=session.session_id), timeout=_DOWNLOAD_CLEANUP_TIMEOUT
-					)
-				except Exception as exc:
-					self.logger.debug(f'Could not close download stream: {exc}')
-			if state_id is not None:
-				try:
-					await asyncio.wait_for(
-						cdp.Runtime.callFunctionOn(
-							params={
-								'objectId': state_id,
-								'functionDeclaration': 'function() { this.controller.abort(); this.blob = null; }',
-								'returnByValue': True,
-							},
-							session_id=session.session_id,
-						),
-						timeout=_DOWNLOAD_CLEANUP_TIMEOUT,
-					)
-				except Exception as exc:
-					self.logger.debug(f'Could not abort or release browser download: {exc}')
-			try:
-				await asyncio.wait_for(
-					cdp.Runtime.releaseObjectGroup(params={'objectGroup': group}, session_id=session.session_id),
-					timeout=_DOWNLOAD_CLEANUP_TIMEOUT,
-				)
-			except Exception as exc:
-				self.logger.debug(f'Could not release download object group: {exc}')
 
 	async def download_file_from_url(
 		self, url: str, target_id: TargetID, content_type: str | None = None, suggested_filename: str | None = None

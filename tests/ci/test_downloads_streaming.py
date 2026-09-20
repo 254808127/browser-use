@@ -143,6 +143,57 @@ async def test_remote_fetch_exception_does_not_publish_file(tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('phase', ['close', 'abort', 'release'])
+@pytest.mark.parametrize('existing', [False, True])
+async def test_cancellation_during_cleanup_does_not_publish_file(tmp_path, phase, existing):
+	watchdog, send = make_watchdog(tmp_path, b'complete')
+	destination = tmp_path / 'report.bin'
+	if existing:
+		destination.write_bytes(b'original')
+	entered = asyncio.Event()
+	finish = asyncio.Event()
+
+	async def pause_cleanup(**kwargs):
+		entered.set()
+		await finish.wait()
+		return {}
+
+	if phase == 'close':
+		send.IO.close.side_effect = pause_cleanup
+	elif phase == 'release':
+		send.Runtime.releaseObjectGroup.side_effect = pause_cleanup
+	else:
+		original = send.Runtime.callFunctionOn.side_effect
+
+		async def pause_abort(**kwargs):
+			if 'abort()' in kwargs['params']['functionDeclaration']:
+				return await pause_cleanup(**kwargs)
+			return await original(**kwargs)
+
+		send.Runtime.callFunctionOn.side_effect = pause_abort
+	task = asyncio.create_task(watchdog._stream_download_from_url('https://example.com/file', 'target', destination))
+	try:
+		await asyncio.wait_for(entered.wait(), timeout=2)
+		# Publication must wait for cleanup even on the success path.
+		assert destination.read_bytes() == b'original' if existing else not destination.exists()
+		task.cancel()
+		await asyncio.sleep(0)
+		assert not task.done()
+		task.cancel()
+		await asyncio.sleep(0)
+		assert not task.done()
+	finally:
+		finish.set()
+		with pytest.raises(asyncio.CancelledError):
+			await asyncio.wait_for(task, timeout=2)
+	assert destination.read_bytes() == b'original' if existing else not destination.exists()
+	assert not list(tmp_path.glob('.browser-use-download-*.part'))
+	send.IO.close.assert_awaited_once()
+	assert 'abort()' in send.Runtime.callFunctionOn.await_args.kwargs['params']['functionDeclaration']
+	send.Runtime.releaseObjectGroup.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_close_failure_does_not_lose_completed_file_or_skip_release(tmp_path):
 	watchdog, send = make_watchdog(tmp_path, b'complete')
 	send.IO.close.side_effect = ConnectionError('closed')
