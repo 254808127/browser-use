@@ -795,6 +795,8 @@ class DownloadsWatchdog(BaseWatchdog):
 			resolved = await asyncio.wait_for(
 				cdp.IO.resolveBlob(params={'objectId': blob_id}, session_id=session.session_id), timeout=_DOWNLOAD_IO_TIMEOUT
 			)
+			# IO.StreamHandle explicitly supports blob:<uuid>; Chromium opens the Blob on the first IO.read.
+			# https://chromedevtools.github.io/devtools-protocol/tot/IO/#type-StreamHandle
 			stream = f'blob:{resolved["uuid"]}'
 			with tempfile.NamedTemporaryFile(
 				prefix='.browser-use-download-', suffix='.part', dir=download_path.parent, delete=False
