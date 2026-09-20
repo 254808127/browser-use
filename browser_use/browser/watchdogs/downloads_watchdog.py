@@ -1,13 +1,14 @@
 """Downloads watchdog for monitoring and handling file downloads."""
 
 import asyncio
-import json
+import base64
 import os
 import re
 import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar
 from urllib.parse import urlparse
+from uuid import uuid4
 
 import anyio
 from bubus import BaseEvent
@@ -15,7 +16,7 @@ from cdp_use.cdp.browser import DownloadProgressEvent as CDPDownloadProgressEven
 from cdp_use.cdp.browser import DownloadWillBeginEvent
 from cdp_use.cdp.network import ResponseReceivedEvent
 from cdp_use.cdp.target import SessionID, TargetID
-from pydantic import PrivateAttr
+from pydantic import BaseModel, Field, PrivateAttr
 
 from browser_use.browser.events import (
 	BrowserLaunchEvent,
@@ -102,6 +103,19 @@ def _should_auto_download_network_response(
 	if _is_generic_text_attachment(url, content_type, suggested_filename):
 		return False
 	return True
+
+
+class _DownloadMetadata(BaseModel):
+	"""Small download metadata; file bytes are read separately through CDP IO."""
+
+	size: int = Field(gt=0)
+	from_cache: bool = False
+
+
+_DOWNLOAD_CHUNK_SIZE = 256 * 1024
+_DOWNLOAD_FETCH_TIMEOUT = 60.0
+_DOWNLOAD_IO_TIMEOUT = 30.0
+_DOWNLOAD_CLEANUP_TIMEOUT = 5.0
 
 
 class DownloadsWatchdog(BaseWatchdog):
@@ -713,6 +727,162 @@ class DownloadsWatchdog(BaseWatchdog):
 		except Exception as e:
 			self.logger.warning(f'[DownloadsWatchdog] Failed to set up network monitoring for target {target_id}: {e}')
 
+	async def _stream_download_from_url(self, url: str, target_id: TargetID, download_path: Path) -> _DownloadMetadata:
+		"""Fetch in the page's context and copy its Blob to disk in bounded CDP chunks.
+
+		Never return the whole file by value. Publish the destination only after
+		all bytes have arrived; on failure or cancellation discard the partial file
+		and release the browser's stream, Blob reference, and pending fetch.
+		"""
+		session = await self.browser_session.get_or_create_cdp_session(target_id, focus=False)
+		cdp = session.cdp_client.send
+		group = f'browser-use-download-{uuid4()}'
+		state_id: str | None = None
+		stream: str | None = None
+		partial_path: Path | None = None
+		try:
+			try:
+				state = await asyncio.wait_for(
+					cdp.Runtime.evaluate(
+						params={
+							'expression': '({controller: new AbortController(), blob: null})',
+							'objectGroup': group,
+							'returnByValue': False,
+						},
+						session_id=session.session_id,
+					),
+					timeout=_DOWNLOAD_IO_TIMEOUT,
+				)
+				state_id = state.get('result', {}).get('objectId')
+				if not state_id or state.get('exceptionDetails'):
+					raise RuntimeError('Could not create browser download state')
+
+				response = await asyncio.wait_for(
+					cdp.Runtime.callFunctionOn(
+						params={
+							'objectId': state_id,
+							'functionDeclaration': """async function(url) {
+								const response = await fetch(url, {cache: 'force-cache', signal: this.controller.signal});
+								if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+								this.blob = await response.blob();
+								return {size: this.blob.size, from_cache: response.headers.has('age') || !response.headers.has('date')};
+							}""",
+							'arguments': [{'value': url}],
+							'awaitPromise': True,
+							'returnByValue': True,
+						},
+						session_id=session.session_id,
+					),
+					timeout=_DOWNLOAD_FETCH_TIMEOUT,
+				)
+				if response.get('exceptionDetails'):
+					raise RuntimeError(
+						f'Browser download failed: {response["exceptionDetails"].get("text", "JavaScript exception")}'
+					)
+				metadata = _DownloadMetadata.model_validate(response.get('result', {}).get('value'))
+				blob = await asyncio.wait_for(
+					cdp.Runtime.callFunctionOn(
+						params={
+							'objectId': state_id,
+							'functionDeclaration': 'function() { return this.blob; }',
+							'objectGroup': group,
+							'returnByValue': False,
+						},
+						session_id=session.session_id,
+					),
+					timeout=_DOWNLOAD_IO_TIMEOUT,
+				)
+				blob_id = blob.get('result', {}).get('objectId')
+				if not blob_id or blob.get('exceptionDetails'):
+					raise RuntimeError('Could not access browser download Blob')
+				resolved = await asyncio.wait_for(
+					cdp.IO.resolveBlob(params={'objectId': blob_id}, session_id=session.session_id), timeout=_DOWNLOAD_IO_TIMEOUT
+				)
+				# IO.StreamHandle explicitly supports blob:<uuid>; Chromium opens the Blob on the first IO.read.
+				# https://chromedevtools.github.io/devtools-protocol/tot/IO/#type-StreamHandle
+				stream = f'blob:{resolved["uuid"]}'
+				with tempfile.NamedTemporaryFile(
+					prefix='.browser-use-download-', suffix='.part', dir=download_path.parent, delete=False
+				) as partial:
+					partial_path = Path(partial.name)
+				written = 0
+				async with await anyio.open_file(partial_path, 'wb') as file:
+					while True:
+						chunk = await asyncio.wait_for(
+							cdp.IO.read(params={'handle': stream, 'size': _DOWNLOAD_CHUNK_SIZE}, session_id=session.session_id),
+							timeout=_DOWNLOAD_IO_TIMEOUT,
+						)
+						data = (
+							base64.b64decode(chunk['data'], validate=True)
+							if chunk.get('base64Encoded')
+							else chunk['data'].encode('utf-8')
+						)
+						if len(data) > _DOWNLOAD_CHUNK_SIZE or written + len(data) > metadata.size:
+							raise ValueError('Download stream exceeded its expected size')
+						await file.write(data)
+						written += len(data)
+						if chunk.get('eof'):
+							break
+						if not data:
+							raise ValueError('Download stream made no progress')
+				if written != metadata.size:
+					raise ValueError(f'Incomplete download: expected {metadata.size} bytes, received {written}')
+			finally:
+
+				async def release_resources() -> None:
+					if stream is not None:
+						try:
+							await asyncio.wait_for(
+								cdp.IO.close(params={'handle': stream}, session_id=session.session_id),
+								timeout=_DOWNLOAD_CLEANUP_TIMEOUT,
+							)
+						except Exception as exc:
+							self.logger.debug(f'Could not close download stream: {exc}')
+					if state_id is not None:
+						try:
+							await asyncio.wait_for(
+								cdp.Runtime.callFunctionOn(
+									params={
+										'objectId': state_id,
+										'functionDeclaration': 'function() { this.controller.abort(); this.blob = null; }',
+										'returnByValue': True,
+									},
+									session_id=session.session_id,
+								),
+								timeout=_DOWNLOAD_CLEANUP_TIMEOUT,
+							)
+						except Exception as exc:
+							self.logger.debug(f'Could not abort or release browser download: {exc}')
+					try:
+						await asyncio.wait_for(
+							cdp.Runtime.releaseObjectGroup(params={'objectGroup': group}, session_id=session.session_id),
+							timeout=_DOWNLOAD_CLEANUP_TIMEOUT,
+						)
+					except Exception as exc:
+						self.logger.debug(f'Could not release download object group: {exc}')
+
+				# A separate task survives cancellation of the download, including repeated cancellation.
+				# Every CDP cleanup operation above retains its own bounded timeout.
+				cleanup_task = asyncio.create_task(release_resources())
+				cancelled: asyncio.CancelledError | None = None
+				while not cleanup_task.done():
+					try:
+						await asyncio.shield(cleanup_task)
+					except asyncio.CancelledError as exc:
+						cancelled = exc
+				cleanup_task.result()
+				if cancelled is not None:
+					raise cancelled
+			# No cancellation point between publication and returning the completed download.
+			os.replace(partial_path, download_path)
+			return metadata
+		finally:
+			if partial_path is not None:
+				try:
+					partial_path.unlink(missing_ok=True)
+				except OSError as exc:
+					self.logger.warning(f'Could not remove partial download {partial_path}: {exc}')
+
 	async def download_file_from_url(
 		self, url: str, target_id: TargetID, content_type: str | None = None, suggested_filename: str | None = None
 	) -> str | None:
@@ -743,9 +913,6 @@ class DownloadsWatchdog(BaseWatchdog):
 			del self._session_pdf_urls[url]
 
 		try:
-			# Get or create CDP session for this target
-			temp_session = await self.browser_session.get_or_create_cdp_session(target_id, focus=False)
-
 			if suggested_filename:
 				filename = self._sanitize_download_filename(suggested_filename)
 			else:
@@ -775,88 +942,42 @@ class DownloadsWatchdog(BaseWatchdog):
 
 			self.logger.debug(f'[DownloadsWatchdog] Downloading from: {url[:100]}...')
 
-			# Download using JavaScript fetch to leverage browser cache
-			escaped_url = json.dumps(url)
-
-			result = await asyncio.wait_for(
-				temp_session.cdp_client.send.Runtime.evaluate(
-					params={
-						'expression': f"""
-				(async () => {{
-					try {{
-						const response = await fetch({escaped_url}, {{
-							cache: 'force-cache'
-						}});
-						if (!response.ok) {{
-							throw new Error(`HTTP error! status: ${{response.status}}`);
-						}}
-						const blob = await response.blob();
-						const arrayBuffer = await blob.arrayBuffer();
-						const uint8Array = new Uint8Array(arrayBuffer);
-
-						return {{
-							data: Array.from(uint8Array),
-							responseSize: uint8Array.length
-						}};
-					}} catch (error) {{
-						throw new Error(`Fetch failed: ${{error.message}}`);
-					}}
-				}})()
-				""",
-						'awaitPromise': True,
-						'returnByValue': True,
-					},
-					session_id=temp_session.session_id,
-				),
-				timeout=15.0,  # 15 second timeout
-			)
-
-			download_result = result.get('result', {}).get('value', {})
-
-			if download_result and download_result.get('data') and len(download_result['data']) > 0:
-				download_path = os.path.join(downloads_dir, final_filename)
-				if not self._is_path_contained(download_path, downloads_dir):
-					self.logger.error(f'[DownloadsWatchdog] Refusing to write download outside downloads_dir: {download_path}')
-					return None
-
-				# Save the file asynchronously
-				async with await anyio.open_file(download_path, 'wb') as f:
-					await f.write(bytes(download_result['data']))
-
-				# Verify file was written successfully
-				if os.path.exists(download_path):
-					actual_size = os.path.getsize(download_path)
-					self.logger.debug(f'[DownloadsWatchdog] File written: {download_path} ({actual_size} bytes)')
-
-					# Determine file type
-					file_ext = Path(final_filename).suffix.lower().lstrip('.')
-					mime_type = content_type or f'application/{file_ext}'
-
-					# Store URL->path mapping for this session
-					self._session_pdf_urls[url] = download_path
-
-					# Emit file downloaded event
-					self.logger.debug(f'[DownloadsWatchdog] Dispatching FileDownloadedEvent for {final_filename}')
-					self.event_bus.dispatch(
-						FileDownloadedEvent(
-							url=url,
-							path=download_path,
-							file_name=final_filename,
-							file_size=actual_size,
-							file_type=file_ext if file_ext else None,
-							mime_type=mime_type,
-							auto_download=True,
-						)
-					)
-
-					return download_path
-				else:
-					self.logger.error(f'[DownloadsWatchdog] Failed to write file: {download_path}')
-					return None
-			else:
-				self.logger.warning(f'[DownloadsWatchdog] No data received when downloading from {url}')
+			download_path = os.path.join(downloads_dir, final_filename)
+			if not self._is_path_contained(download_path, downloads_dir):
+				self.logger.error(f'[DownloadsWatchdog] Refusing to write download outside downloads_dir: {download_path}')
 				return None
+			await self._stream_download_from_url(url, target_id, Path(download_path))
 
+			# Verify file was written successfully
+			if os.path.exists(download_path):
+				actual_size = os.path.getsize(download_path)
+				self.logger.debug(f'[DownloadsWatchdog] File written: {download_path} ({actual_size} bytes)')
+
+				# Determine file type
+				file_ext = Path(final_filename).suffix.lower().lstrip('.')
+				mime_type = content_type or f'application/{file_ext}'
+
+				# Store URL->path mapping for this session
+				self._session_pdf_urls[url] = download_path
+
+				# Emit file downloaded event
+				self.logger.debug(f'[DownloadsWatchdog] Dispatching FileDownloadedEvent for {final_filename}')
+				self.event_bus.dispatch(
+					FileDownloadedEvent(
+						url=url,
+						path=download_path,
+						file_name=final_filename,
+						file_size=actual_size,
+						file_type=file_ext if file_ext else None,
+						mime_type=mime_type,
+						auto_download=True,
+					)
+				)
+
+				return download_path
+			else:
+				self.logger.error(f'[DownloadsWatchdog] Failed to write file: {download_path}')
+				return None
 		except TimeoutError:
 			self.logger.warning(f'[DownloadsWatchdog] Download timed out: {url[:80]}...')
 			return None
@@ -1337,106 +1458,48 @@ class DownloadsWatchdog(BaseWatchdog):
 
 			self.logger.debug(f'[DownloadsWatchdog] Starting PDF download from: {pdf_url[:100]}...')
 
-			# Download using JavaScript fetch to leverage browser cache
 			try:
-				# Properly escape the URL to prevent JavaScript injection
-				escaped_pdf_url = json.dumps(pdf_url)
+				download_path = os.path.join(downloads_dir, final_filename)
+				if not self._is_path_contained(download_path, downloads_dir):
+					self.logger.error(f'[DownloadsWatchdog] Refusing to write PDF outside downloads_dir: {download_path}')
+					return None
+				metadata = await self._stream_download_from_url(pdf_url, target_id, Path(download_path))
 
-				result = await asyncio.wait_for(
-					temp_session.cdp_client.send.Runtime.evaluate(
-						params={
-							'expression': f"""
-					(async () => {{
-						try {{
-							// Use fetch with cache: 'force-cache' to prioritize cached version
-							const response = await fetch({escaped_pdf_url}, {{
-								cache: 'force-cache'
-							}});
-							if (!response.ok) {{
-								throw new Error(`HTTP error! status: ${{response.status}}`);
-							}}
-							const blob = await response.blob();
-							const arrayBuffer = await blob.arrayBuffer();
-							const uint8Array = new Uint8Array(arrayBuffer);
-							
-							// Check if served from cache
-							const fromCache = response.headers.has('age') || 
-											 !response.headers.has('date');
-											 
-							return {{ 
-								data: Array.from(uint8Array),
-								fromCache: fromCache,
-								responseSize: uint8Array.length,
-								transferSize: response.headers.get('content-length') || 'unknown'
-							}};
-						}} catch (error) {{
-							throw new Error(`Fetch failed: ${{error.message}}`);
-						}}
-					}})()
-					""",
-							'awaitPromise': True,
-							'returnByValue': True,
-						},
-						session_id=temp_session.session_id,
-					),
-					timeout=10.0,  # 10 second timeout for download operation
-				)
-				download_result = result.get('result', {}).get('value', {})
-
-				if download_result and download_result.get('data') and len(download_result['data']) > 0:
-					# Ensure downloads directory exists
-					downloads_dir = str(self.browser_session.browser_profile.downloads_path)
-					os.makedirs(downloads_dir, exist_ok=True)
-					download_path = os.path.join(downloads_dir, final_filename)
-					if not self._is_path_contained(download_path, downloads_dir):
-						self.logger.error(f'[DownloadsWatchdog] Refusing to write PDF outside downloads_dir: {download_path}')
-						return None
-
-					# Save the PDF asynchronously
-					async with await anyio.open_file(download_path, 'wb') as f:
-						await f.write(bytes(download_result['data']))
-
-					# Verify file was written successfully
-					if os.path.exists(download_path):
-						actual_size = os.path.getsize(download_path)
-						self.logger.debug(
-							f'[DownloadsWatchdog] PDF file written successfully: {download_path} ({actual_size} bytes)'
-						)
-					else:
-						self.logger.error(f'[DownloadsWatchdog] ❌ Failed to write PDF file to: {download_path}')
-						return None
-
-					# Log cache information
-					cache_status = 'from cache' if download_result.get('fromCache') else 'from network'
-					response_size = download_result.get('responseSize', 0)
-					self.logger.debug(
-						f'[DownloadsWatchdog] ✅ Auto-downloaded PDF ({cache_status}, {response_size:,} bytes): {download_path}'
-					)
-
-					# Store URL->path mapping for this session
-					self._session_pdf_urls[pdf_url] = download_path
-
-					# Emit file downloaded event
-					self.logger.debug(f'[DownloadsWatchdog] Dispatching FileDownloadedEvent for {final_filename}')
-					self.event_bus.dispatch(
-						FileDownloadedEvent(
-							url=pdf_url,
-							path=download_path,
-							file_name=final_filename,
-							file_size=response_size,
-							file_type='pdf',
-							mime_type='application/pdf',
-							from_cache=download_result.get('fromCache', False),
-							auto_download=True,
-						)
-					)
-
-					# No need to detach - session is cached
-					return download_path
+				# Verify file was written successfully
+				if os.path.exists(download_path):
+					actual_size = os.path.getsize(download_path)
+					self.logger.debug(f'[DownloadsWatchdog] PDF file written successfully: {download_path} ({actual_size} bytes)')
 				else:
-					self.logger.warning(f'[DownloadsWatchdog] No data received when downloading PDF from {pdf_url}')
+					self.logger.error(f'[DownloadsWatchdog] ❌ Failed to write PDF file to: {download_path}')
 					return None
 
+				# Log cache information
+				cache_status = 'from cache' if metadata.from_cache else 'from network'
+				response_size = metadata.size
+				self.logger.debug(
+					f'[DownloadsWatchdog] ✅ Auto-downloaded PDF ({cache_status}, {response_size:,} bytes): {download_path}'
+				)
+
+				# Store URL->path mapping for this session
+				self._session_pdf_urls[pdf_url] = download_path
+
+				# Emit file downloaded event
+				self.logger.debug(f'[DownloadsWatchdog] Dispatching FileDownloadedEvent for {final_filename}')
+				self.event_bus.dispatch(
+					FileDownloadedEvent(
+						url=pdf_url,
+						path=download_path,
+						file_name=final_filename,
+						file_size=response_size,
+						file_type='pdf',
+						mime_type='application/pdf',
+						from_cache=metadata.from_cache,
+						auto_download=True,
+					)
+				)
+
+				# No need to detach - session is cached
+				return download_path
 			except Exception as e:
 				self.logger.warning(f'[DownloadsWatchdog] Failed to auto-download PDF from {pdf_url}: {type(e).__name__}: {e}')
 				return None
