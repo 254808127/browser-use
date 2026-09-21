@@ -222,6 +222,7 @@ class SimplifiedNode:
 	children: list['SimplifiedNode']
 	should_display: bool = True
 	is_interactive: bool = False  # True if element is in selector_map
+	selector_index: int | None = None
 
 	is_new: bool = False
 
@@ -251,6 +252,7 @@ class SimplifiedNode:
 		return {
 			'should_display': self.should_display,
 			'is_interactive': self.is_interactive,
+			'selector_index': self.selector_index,
 			'ignored_by_paint_order': self.ignored_by_paint_order,
 			'excluded_by_parent': self.excluded_by_parent,
 			'original_node': cleaned_original_node_json,
@@ -351,6 +353,10 @@ class EnhancedSnapshotNode:
 	"""Paint order from the layout tree"""
 	stacking_contexts: int | None
 	"""Stacking contexts from the layout tree"""
+	input_value: str | None = None
+	"""Live value of an <input> or <textarea> (DOMSnapshot inputValue/textValue), which the value attribute misses when JS, autofill, or a framework set it."""
+	input_checked: bool | None = None
+	"""Live checked state of a checkbox or radio input (DOMSnapshot inputChecked)."""
 
 
 # @dataclass(slots=True)

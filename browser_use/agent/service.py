@@ -61,6 +61,7 @@ from browser_use.agent.views import (
 	PlanItem,
 	StepMetadata,
 )
+from browser_use.browser.cloud.views import CloudBrowserAuthError
 from browser_use.browser.events import _get_timeout
 from browser_use.browser.session import DEFAULT_BROWSER_PROFILE
 from browser_use.browser.views import BrowserStateSummary
@@ -77,6 +78,7 @@ from browser_use.utils import (
 	_log_pretty_path,
 	check_latest_browser_use_version,
 	get_browser_use_version,
+	has_url_negation,
 	is_placeholder_url,
 	sanitize_url_candidate,
 	time_execution_async,
@@ -362,10 +364,12 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		if self.output_model_schema is not None:
 			self.tools.use_structured_output_action(self.output_model_schema)
 
-		# Extraction schema: explicit param takes priority, otherwise auto-bridge from output_model_schema
+		# Per-page extract uses a schema only when the caller explicitly asks for one.
+		# It must NOT inherit output_model_schema: that describes the final task result
+		# (e.g. {summary, step_results}), which is the wrong shape for a single-page
+		# extraction and, on the browser-use gateway, routes extract into the agent
+		# action protocol and breaks it.
 		self.extraction_schema = extraction_schema
-		if self.extraction_schema is None and self.output_model_schema is not None:
-			self.extraction_schema = self.output_model_schema.model_json_schema()
 
 		# Core components - task enhancement now has access to output_model_schema from tools
 		self.task = self._enhance_task_with_schema(task, output_model_schema)
@@ -674,11 +678,16 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		if not self.has_downloads_path:
 			return
 
-		current_files = set(self.available_file_paths or [])
-		new_files = set(downloads) - current_files
+		available_files = self.available_file_paths or []
+		seen_files = set(available_files)
+		new_files = []
+		for download in downloads:
+			if download not in seen_files:
+				seen_files.add(download)
+				new_files.append(download)
 
 		if new_files:
-			self.available_file_paths = list(current_files | new_files)
+			self.available_file_paths = [*available_files, *new_files]
 
 			self.logger.info(
 				f'📁 Added {len(new_files)} downloaded files to available_file_paths (total: {len(self.available_file_paths)} files)'
@@ -686,7 +695,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			for file_path in new_files:
 				self.logger.info(f'📄 New file available: {file_path}')
 		else:
-			self.logger.debug(f'📁 No new downloads detected (tracking {len(current_files)} files)')
+			self.logger.debug(f'📁 No new downloads detected (tracking {len(available_files)} files)')
 
 	def _set_file_system(self, file_system_path: str | None = None) -> None:
 		# Check for conflicting parameters
@@ -1537,7 +1546,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		This gives the LLM advance notice to wrap up, save partial results, and call done
 		rather than exhausting all steps with nothing saved.
 		"""
-		if step_info is None:
+		if step_info is None or step_info.max_steps <= 0:
 			return
 
 		steps_used = step_info.step_number + 1  # Convert 0-indexed to 1-indexed
@@ -1652,10 +1661,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 				if judgement.failure_reason:
 					judge_log += f'   Failure Reason: {judgement.failure_reason}\n'
 				if judgement.reached_captcha:
-					self.logger.warning(
-						'Agent was blocked by a captcha. Cloud browsers include stealth fingerprinting and proxy rotation to avoid this.\n'
-						'         Try: Browser(use_cloud=True)  |  Get an API key: https://cloud.browser-use.com?utm_source=oss&utm_medium=captcha_nudge'
-					)
+					self._log_cloud_captcha_hint()
 				judge_log += f'   {judgement.reasoning}\n'
 				self.logger.info(judge_log)
 
@@ -2153,8 +2159,31 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		self.logger.debug(message)
 		return message
 
-	def _log_final_outcome_messages(self) -> None:
+	def _log_cloud_captcha_hint(self) -> None:
+		"""Point local-browser users at cloud browsers after a captcha block, at most once per run."""
+		if getattr(self, '_cloud_captcha_hint_logged', False) or not CONFIG.BROWSER_USE_CLOUD_HINTS:
+			return
+		session = self.browser_session
+		if session is not None:
+			profile = session.browser_profile
+			if session.cdp_url:
+				# start() connects to an explicit cdp_url even when use_cloud=True, so trust the host
+				on_browser_use_cloud = (urlparse(session.cdp_url).hostname or '').endswith('.browser-use.com')
+			else:
+				on_browser_use_cloud = profile.use_cloud or profile.cloud_browser_params is not None
+			if on_browser_use_cloud:
+				return
+		self._cloud_captcha_hint_logged = True
+		self.logger.warning(
+			'Agent was blocked by a captcha. Cloud browsers include stealth fingerprinting and proxy rotation to avoid this.\n'
+			'         Try: Browser(use_cloud=True)  |  Get an API key: https://cloud.browser-use.com?utm_source=oss&utm_medium=captcha_nudge\n'
+			'         Silence this hint: BROWSER_USE_CLOUD_HINTS=false'
+		)
+
+	def _log_final_outcome_messages(self, cloud_auth_failed: bool = False) -> None:
 		"""Log helpful messages to user based on agent run outcome"""
+		if cloud_auth_failed:
+			return  # the missing/invalid key message already says what to do; it is not a bug to report
 		# Check if agent failed
 		is_successful = self.history.is_successful()
 
@@ -2168,10 +2197,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			has_captcha_issue = any(keyword in final_result_str for keyword in captcha_keywords)
 
 			if has_captcha_issue:
-				self.logger.warning(
-					'Agent was blocked by a captcha. Cloud browsers include stealth fingerprinting and proxy rotation to avoid this.\n'
-					'         Try: Browser(use_cloud=True)  |  Get an API key: https://cloud.browser-use.com?utm_source=oss&utm_medium=captcha_nudge'
-				)
+				self._log_cloud_captcha_hint()
 
 			# General failure message
 			self.logger.info('')
@@ -2288,7 +2314,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 
 		# Look for common URL patterns
 		patterns = [
-			r'https?://[^\s<>"\']+',  # Full URLs with http/https
+			r'(?:https?|file)://[^\s<>"\']+',  # Full URLs
 			r'(?:www\.)?[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)*\.[a-zA-Z]{2,}(?:/[^\s<>"\']*)?',  # Domain names with subdomains and optional paths
 		]
 
@@ -2365,19 +2391,18 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			'polynomial',
 		}
 
-		excluded_words = {
-			'never',
-			'dont',
-			'not',
-			"don't",
-		}
-
 		found_urls = []
+		matched_spans: list[tuple[int, int]] = []
 		for pattern in patterns:
 			matches = re.finditer(pattern, task_without_emails)
 			for match in matches:
 				url = match.group(0)
 				original_position = match.start()  # Store original position before URL modification
+
+				# Skip fragments of URLs already matched by earlier pattern
+				if any(match.start() < end and match.end() > start for start, end in matched_spans):
+					continue
+				matched_spans.append((match.start(), match.end()))
 
 				# Remove trailing punctuation that's not part of URLs
 				url = sanitize_url_candidate(url)
@@ -2386,29 +2411,32 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 					self.logger.debug(f'Excluding placeholder URL from auto-navigation: {url}')
 					continue
 
-				# Check if URL ends with a file extension that should be excluded
 				url_lower = url.lower()
+				has_scheme = url_lower.startswith(('http://', 'https://', 'file://'))
+
+				# Check if URL ends with file extension
 				should_exclude = False
-				for ext in excluded_extensions:
-					if f'.{ext}' in url_lower:
+				if not url_lower.startswith('file://'):
+					for ext in excluded_extensions:
+						if f'.{ext}' in url_lower:
+							should_exclude = True
+							break
+					if not has_scheme and '.htm' in url_lower:
 						should_exclude = True
-						break
 
 				if should_exclude:
 					self.logger.debug(f'Excluding URL with file extension from auto-navigation: {url}')
 					continue
 
-				# If in the 20 characters before the url position is a word in excluded_words skip to avoid "Never go to this url"
+				# Skip URLs explicitly negated by nearby prose, such as "Never go to this URL".
 				context_start = max(0, original_position - 20)
 				context_text = task_without_emails[context_start:original_position]
-				if any(word.lower() in context_text.lower() for word in excluded_words):
-					self.logger.debug(
-						f'Excluding URL with word in excluded words from auto-navigation: {url} (context: "{context_text.strip()}")'
-					)
+				if has_url_negation(context_text):
+					self.logger.debug(f'Excluding negated URL from auto-navigation: {url} (context: "{context_text.strip()}")')
 					continue
 
-				# Add https:// if missing (after excluded words check to avoid position calculation issues)
-				if not url.startswith(('http://', 'https://')):
+				# Add https:// after the negation check to preserve source positions.
+				if not has_scheme:
 					url = 'https://' + url
 
 				found_urls.append(url)
@@ -2500,7 +2528,9 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 
 		loop = asyncio.get_event_loop()
 		agent_run_error: str | None = None  # Initialize error tracking variable
+		cloud_auth_failed = False
 		self._force_exit_telemetry_logged = False  # ADDED: Flag for custom telemetry on force exit
+		self._cloud_captcha_hint_logged = False
 		should_delay_close = False
 
 		# Set up the  signal handler with callbacks specific to this agent
@@ -2659,7 +2689,12 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			return self.history
 
 		except Exception as e:
-			self.logger.error(f'Agent run failed with exception: {e}', exc_info=True)
+			if isinstance(e, CloudBrowserAuthError):
+				# Actionable config error: show the message once, without a traceback.
+				cloud_auth_failed = True
+				self.logger.error(f'Agent run failed: {e}')
+			else:
+				self.logger.error(f'Agent run failed with exception: {e}', exc_info=True)
 			agent_run_error = str(e)
 			raise e
 
@@ -2707,7 +2742,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 					self.eventbus.dispatch(output_event)
 
 			# Log final messages to user based on outcome
-			self._log_final_outcome_messages()
+			self._log_final_outcome_messages(cloud_auth_failed=cloud_auth_failed)
 
 			# Stop the event bus gracefully, waiting for all events to be processed
 			# Configurable via TIMEOUT_AgentEventBusStop env var (default: 3.0s)
@@ -3537,6 +3572,15 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			return action
 
 		selector_map = browser_state_summary.dom_state.selector_map
+		selector_items = list(selector_map.items())
+		if historical_element.frame_id:
+			same_frame_items = [
+				(index, element) for index, element in selector_items if element.frame_id == historical_element.frame_id
+			]
+			if same_frame_items:
+				selector_items = same_frame_items + [
+					(index, element) for index, element in selector_items if element.frame_id != historical_element.frame_id
+				]
 		highlight_index: int | None = None
 		match_level: MatchLevel | None = None
 
@@ -3550,7 +3594,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			hist_name = historical_element.node_name.lower()
 			matching_nodes = [
 				(idx, elem.node_name, elem.attributes.get('name') if elem.attributes else None)
-				for idx, elem in selector_map.items()
+				for idx, elem in selector_items
 				if elem.node_name.lower() == hist_name
 			]
 			self.logger.info(
@@ -3559,7 +3603,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			)
 
 		# Level 1: EXACT hash match
-		for idx, elem in selector_map.items():
+		for idx, elem in selector_items:
 			if elem.element_hash == historical_element.element_hash:
 				highlight_index = idx
 				match_level = MatchLevel.EXACT
@@ -3571,7 +3615,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		# Level 2: STABLE hash match (dynamic classes filtered)
 		# Use stored stable_hash (computed at save time from EnhancedDOMTreeNode - single source of truth)
 		if highlight_index is None and historical_element.stable_hash is not None:
-			for idx, elem in selector_map.items():
+			for idx, elem in selector_items:
 				if elem.compute_stable_hash() == historical_element.stable_hash:
 					highlight_index = idx
 					match_level = MatchLevel.STABLE
@@ -3584,7 +3628,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 
 		# Level 3: XPATH match
 		if highlight_index is None and historical_element.x_path:
-			for idx, elem in selector_map.items():
+			for idx, elem in selector_items:
 				if elem.xpath == historical_element.x_path:
 					highlight_index = idx
 					match_level = MatchLevel.XPATH
@@ -3599,7 +3643,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 		if highlight_index is None and historical_element.ax_name:
 			hist_name = historical_element.node_name.lower()
 			hist_ax_name = historical_element.ax_name
-			for idx, elem in selector_map.items():
+			for idx, elem in selector_items:
 				# Match by node type and accessible name
 				elem_ax_name = elem.ax_node.name if elem.ax_node else None
 				if elem.node_name.lower() == hist_name and elem_ax_name == hist_ax_name:
@@ -3611,7 +3655,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 				# Log available ax_names for debugging
 				same_type_ax_names = [
 					(idx, elem.ax_node.name if elem.ax_node else None)
-					for idx, elem in selector_map.items()
+					for idx, elem in selector_items
 					if elem.node_name.lower() == hist_name and elem.ax_node and elem.ax_node.name
 				]
 				self.logger.debug(
@@ -3628,7 +3672,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 			# Try matching by unique identifiers: name, id, or aria-label
 			for attr_key in ['name', 'id', 'aria-label']:
 				if attr_key in hist_attrs and hist_attrs[attr_key]:
-					for idx, elem in selector_map.items():
+					for idx, elem in selector_items:
 						if (
 							elem.node_name.lower() == hist_name
 							and elem.attributes
@@ -3646,7 +3690,7 @@ class Agent(Generic[Context, AgentStructuredOutput]):
 				# Log what was tried and what's available on the page for debugging
 				same_node_elements = [
 					(idx, elem.attributes.get('aria-label') or elem.attributes.get('id') or elem.attributes.get('name'))
-					for idx, elem in selector_map.items()
+					for idx, elem in selector_items
 					if elem.node_name.lower() == hist_name and elem.attributes
 				]
 				self.logger.info(
