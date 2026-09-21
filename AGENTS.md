@@ -3,6 +3,7 @@
 Browser-Use is an AI agent that autonomously interacts with the web. It takes a user-defined task, navigates web pages using Chromium via CDP, processes HTML, and repeatedly queries a language model to decide the next action—until the task is completed.
 
 # Development Rules
+- This maintained fork integrates all downstream browser-use fixes on `254808127/browser-use:main`. Preserve the session race, OOPIF and bounded download patches when updating upstream. Read `.github/FORK_MAINTENANCE.md` before syncing or publishing changes to this fork.
 - Always use [`uv`](https://github.com/astral-sh/uv) instead of `pip`
 ```bash
 uv venv --python 3.11
