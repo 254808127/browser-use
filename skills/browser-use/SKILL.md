@@ -1,11 +1,33 @@
 ---
 name: browser-use
 description: "Direct browser control via CDP for web interaction: automation, scraping, testing, screenshots, and site/app work."
+homepage: https://browser-use.com
+metadata:
+  {
+    "openclaw":
+      {
+        "requires": { "bins": ["browser-use"] },
+        "install":
+          [
+            {
+              "id": "uv",
+              "kind": "uv",
+              "package": "browser-use",
+              "bins": ["browser-use"],
+              "label": "Install Browser Use CLI (uv)",
+            },
+          ],
+      },
+  }
 ---
 
 # Browser Use
 
 Direct browser control via CDP. For task-specific edits, use `agent-workspace/agent_helpers.py`. For setup, install, or connection problems, read https://github.com/browser-use/browser-harness/blob/main/install.md.
+
+## When Not to Use
+
+A basic fetch of public information needs no browser. If a plain HTTP request can read it — a public page, an API, docs — use `curl` or your fetch tool, and leave the browser alone. Use browser-use when the task needs interaction (click, type, navigate), the user's logged-in session, JS rendering, or a bot-protected page. If a direct fetch fails or returns a shell page, then escalate to the browser.
 
 Domain skills are off by default. Set `BH_DOMAIN_SKILLS=1` to enable them; see the bottom section.
 
@@ -21,7 +43,24 @@ PY
 
 - Invoke as `browser-use`. Use heredocs for multi-line commands.
 - Helpers are pre-imported. `run.py` calls `ensure_daemon()` before `exec`.
-- First navigation is `new_tab(url)`, not `goto_url(url)`.
+- First navigation for a task is `new_tab(url)`, not `goto_url(url)`. The daemon
+  preserves the attached tab across separate CLI invocations, so do not call
+  `new_tab()` again in every script.
+- Keep one working tab per task/site. Before opening another, inspect
+  `current_tab()` and `list_tabs()` and use `switch_tab()` to reuse a matching
+  tab. Do not leave duplicate tabs on the same URL or close tabs you did not
+  create.
+- `new_tab()` and `switch_tab()` attach and move the horse marker without
+  changing Chrome's visible tab. Screenshots and normal CDP input work in the
+  background; call `activate_tab(target)` only when the user explicitly asks
+  or a page demonstrably pauses rendering while hidden.
+- Set `BH_TAB_MARKER=0` before starting the daemon to leave page titles unchanged.
+  The horse marker remains enabled by default.
+- A timed-out `scroll(...)` on an attached background tab is evidence that the
+  page needs to be visible. Call `activate_tab(current_tab())`, retry the same
+  scroll once, then re-read the scroll position. This visibly switches tabs,
+  so do not use it when the user has forbidden foreground changes. Do not
+  invent a `Runtime.evaluate` scroll replacement or a cross-frame JS walker.
 - The normal local flow attaches to the running Chrome/Chromium CDP endpoint. No browser ids or local profile selection.
 
 ## Local Chrome
@@ -32,13 +71,30 @@ If the daemon cannot connect, run diagnostics:
 browser-use --doctor
 ```
 
-If Chrome remote debugging is not enabled, the harness opens:
+If Chrome is not running at all, the harness launches it automatically and retries.
+
+If Chrome is running but remote debugging is not enabled, the harness opens:
 
 ```text
 chrome://inspect/#remote-debugging
 ```
 
-Ask the user to tick "Allow remote debugging for this browser instance" and click Allow if Chrome shows a permission popup. Then retry the same `browser-use` command.
+On macOS, when local Chrome asks for remote-debugging permission, keep the
+original browser command running and call `mac-approve` in another shell/tool
+call. Preserve the exact daemon name: if the waiting command used
+`BU_NAME=r7k2`, run:
+
+```text
+BU_NAME=r7k2 browser-use mac-approve
+```
+
+For the default daemon, omit the `BU_NAME` prefix. The original command resumes
+when the helper returns `ready`; do not rerun it. If the helper reports
+`accessibility-required`, ask the user once to grant the app launching
+browser-use (for example Terminal, iTerm, or Codex) access in System
+Settings > Privacy & Security > Accessibility, then call `mac-approve` once
+again. This is only for local Chrome; do not call it for `BU_CDP_URL`,
+`BU_CDP_WS`, or Browser Use Cloud.
 
 ## Remote Browsers
 
@@ -84,13 +140,44 @@ Cloud profile cookie sync reference: https://github.com/browser-use/browser-harn
 
 ## Page Workflow
 
-- Screenshots first: use `capture_screenshot()` to understand visible state.
-- Clicking: screenshot -> read pixel -> `click_at_xy(x, y)` -> screenshot again.
+- Prefer to find elements with the accessibility tree, not screenshots: `cdp("Accessibility.getFullAXTree")["nodes"]` has every element's role, name, and `backendDOMNodeId` — filter in Python before printing (it is thousands of nodes). Coordinates: `q = cdp("DOM.getBoxModel", backendNodeId=n)["model"]["content"]; x, y = sum(q[0::2])/4, sum(q[1::2])/4` (viewport px, ready for `click_at_xy`; negative/oversized means scroll first).
+- Clicking: AX node -> box center -> `click_at_xy(x, y)` -> verify with a targeted `js(...)`/`page_info()` check.
+- Fall back to raw HTML via `js(...)` only when the AX tree lacks the element (canvas, exotic widgets); screenshot when layout or imagery matters.
 - After navigation, call `wait_for_load()`.
 - If the current tab is stale or internal, call `ensure_real_tab()`.
 - Use `js(...)` for DOM inspection or extraction when coordinates are the wrong tool.
+- When entering unusually long text, avoid slow per-character typing: find a faster page-appropriate input method, then verify the page kept the exact value.
 - Login walls: stop and ask. Exception: use available SSO automatically when Chrome is already signed in; still stop for passwords, MFA, consent, or ambiguous account choice.
 - Raw CDP is available with `cdp("Domain.method", ...)`.
+
+## Recordings and Videos
+
+Fresh installs do not record. Users can enable local background traces:
+
+```bash
+browser-use recordings enable
+browser-use recordings disable
+browser-use recordings
+```
+
+`BH_RECORD=1` or `BH_RECORD=0` overrides the preference for one process. Any
+natural nudge to “record,” “show,” “demo,” or “make a video” opts in that task;
+significant work alone does not.
+
+Before browser work, call `start_recording(name, title=...)`, retain its exact
+returned directory, and call `stop_recording()` after verifying the result.
+Never replace that path with `recordings --latest`. For a request made after
+the task, use:
+
+```bash
+browser-use recordings --latest
+```
+
+Use it only if timestamps and pages match; otherwise say the work was not
+captured. Never reenact a completed task. For a video, follow
+[make-video.md](https://github.com/browser-use/browser-harness/blob/main/interaction-skills/make-video.md).
+If sub-agents are available, they may handle post-production from the exact
+recording path while the main agent returns the task result.
 
 ## Interaction Skills
 
@@ -104,6 +191,7 @@ If you get stuck on a browser mechanic, check https://github.com/browser-use/bro
 - drag-and-drop.md
 - dropdowns.md
 - iframes.md
+- make-video.md
 - network-requests.md
 - print-as-pdf.md
 - profile-sync.md
@@ -118,12 +206,19 @@ If you get stuck on a browser mechanic, check https://github.com/browser-use/bro
 
 - Coordinate clicks default. CDP mouse events pass through iframes/shadow/cross-origin at the compositor level.
 - Keep the connection model simple: use the default daemon, `BU_NAME`, `BU_CDP_URL`, `BU_CDP_WS`, or `start_remote_daemon(...)`.
+- Trusted orchestrators can set `BH_OPEN_LIVE_URL=0` while provisioning a Cloud
+  daemon to keep its interactive live-view URL from being printed or opened.
+  The URL is still created and returned by `start_remote_daemon()`; callers must
+  avoid logging or serializing that returned field.
+- Trusted orchestrators that already provisioned an exact named daemon can set
+  `BH_REQUIRE_EXISTING_DAEMON=1`. Each CLI call then health-checks and reuses
+  that daemon or fails closed; it never auto-starts or discovers another Chrome.
 - Core helpers stay short. Put task-specific helper additions in `$BH_AGENT_WORKSPACE/agent_helpers.py`.
 
 ## Gotchas
 
 - `chrome://inspect/#remote-debugging` must be enabled for local Chrome control.
-- Chrome may show an "Allow remote debugging?" popup; wait for the user to click Allow.
+- On macOS, if local Chrome shows an "Allow remote debugging?" popup, call `mac-approve` once with the same `BU_NAME` while the original browser command waits. Do not poll or rerun the browser command; remote and cloud browsers do not use this helper.
 - Omnibox popups are not real work tabs.
 - CDP target order is not Chrome's visible tab-strip order.
 - `BU_CDP_URL` is an HTTP DevTools endpoint; the daemon resolves it to WebSocket.
