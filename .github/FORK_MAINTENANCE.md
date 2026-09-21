@@ -18,35 +18,11 @@ this branch. Updating this branch does not update existing deployments or pins.
 Review these patches when upstream implements an equivalent fix. Do not delete
 a patch or its regression tests solely because Git reports a clean merge.
 
-## Sync script
+## Operational automation
 
-Run with Python 3.11+, Git, uv, and a working local Chromium installation.
-The script clones into a new output directory and never modifies a developer's
-checkout. It retains that directory and logs for troubleshooting.
-
-```bash
-python bin/sync_fork.py --output /path/to/new-run-directory
-```
-
-This prepares and checks a candidate without pushing. Add `--publish` to update
-remote main after the checks pass. The default is `--strategy merge`, preserving
-commit history. Explicit `--strategy rebase` replays fork history and can change
-commit IDs; coordinate this with other contributors before using it.
-
-The checks include pre-commit and at least 51 passing regression cases with no
-skips, including a real Chromium download. They do not run production agents or
-guarantee compatibility with every site, model or deployment configuration.
-Run additional integration checks when upstream changes relevant behavior.
-
-Publication atomically creates `backup/main-<UTC timestamp>-<old SHA>` and updates
-main. An explicit lease rejects concurrent changes to remote main. Conflicts,
-dependency errors, failed or skipped tests, formatting changes and push failures
-stop publication. No conflict resolution or force override is attempted.
-
-A scheduler can invoke the script daily with a unique output directory. No
-scheduler is enabled by adding this script. Retain failed logs, notify the
-maintainer, and never retry by bypassing the checks. A Git backup preserves
-source code, not container images, installed dependencies or runtime data.
+The upstream sync runner and notification configuration are maintained outside
+this source repository on the maintenance host. Do not add scheduling scripts
+or notification credentials to this repository.
 
 ## Initial integration validation (2026-09-21)
 
